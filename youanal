@@ -1,0 +1,697 @@
+import os
+import re
+import pickle
+import datetime as dt
+import json
+import asyncio
+from collections import Counter
+import pandas as pd
+import requests
+
+import httplib2
+import google_auth_httplib2
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+# ============================ TELEGRAM (ЗАКОММЕНТИРОВАНО) ============================
+# from telethon import TelegramClient, functions
+# from telethon.tl.functions.channels import GetFullChannelRequest
+# from telethon.errors import ChatAdminRequiredError
+
+# ============================ НАСТРОЙКИ ============================
+CLIENT_ID = "1020606158680-3pjnjbghee916ip68sdc6soeuceev4h4.apps.googleusercontent.com"
+CLIENT_SECRET = "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"  # СМЕНИТЕ!
+
+SCOPES = [
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
+    "https://www.googleapis.com/auth/youtube.readonly",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
+]
+
+TOKEN_FILE = "token.pickle"
+OUTPUT_DIR = "report"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ============================ ПРОКСИ (YouTube) ============================
+PROXY_HOST = "81.180.252.48"
+PROXY_PORT = 5432
+PROXY_USER = "n5re7"
+PROXY_PASS = "eg5p94bv"
+
+# ============================ TELEGRAM BOT (для отправки отчёта) ============================
+TG_BOT_TOKEN = "ВАШ_ТОКЕН_БОТА"           # ← токен от @BotFather
+TG_REPORT_CHAT_ID = "ВАШ_CHAT_ID"          # ← ID чата/канала для отчёта
+
+# ============================ TELEGRAM (СБОР ДАННЫХ — ЗАКОММЕНТИРОВАНО) ============================
+# TG_API_ID = 12345678              # ← ваш api_id
+# TG_API_HASH = "your_api_hash"     # ← ваш api_hash
+# TG_CHANNEL = "thestepofdnbd"      # без @
+# TG_SESSION = "tg_session"
+
+# ============================ VK (ЗАКОММЕНТИРОВАНО) ============================
+# VK_GROUP_ID = 123456789          # ← ID вашего сообщества (число, без минуса)
+# VK_TOKEN = "your_vk_token"       # ← токен сообщества с правами stats
+# VK_GROUP_SCREEN_NAME = "thestepofdnb"  # ← короткое имя (для ссылок)
+
+
+# ============================ АВТОРИЗАЦИЯ YOUTUBE ============================
+def get_credentials():
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, "rb") as f:
+            creds = pickle.load(f)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            client_config = {
+                "installed": {
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"],
+                }
+            }
+            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_FILE, "wb") as f:
+            pickle.dump(creds, f)
+    return creds
+
+
+def build_service(service_name, version, creds):
+    proxy_info = httplib2.ProxyInfo(
+        proxy_type=httplib2.socks.PROXY_TYPE_HTTP,
+        proxy_host=PROXY_HOST,
+        proxy_port=PROXY_PORT,
+        proxy_user=PROXY_USER,
+        proxy_pass=PROXY_PASS,
+    )
+    http = httplib2.Http(proxy_info=proxy_info, timeout=60)
+    authorized_http = google_auth_httplib2.AuthorizedHttp(creds, http=http)
+    return build(service_name, version, http=authorized_http)
+
+
+# ============================ ХЕЛПЕРЫ ДЛЯ ДАТ И ДЛИТЕЛЬНОСТИ ============================
+def parse_iso_duration(iso):
+    """PT1H2M3S → секунды"""
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso or "")
+    if not m:
+        return 0
+    h = int(m.group(1) or 0)
+    m_ = int(m.group(2) or 0)
+    s = int(m.group(3) or 0)
+    return h * 3600 + m_ * 60 + s
+
+
+def format_published(published_iso):
+    """Точное время публикации: 14.09.2026 18:32"""
+    if not published_iso:
+        return "—"
+    try:
+        pub_dt = dt.datetime.fromisoformat(published_iso.replace("Z", "+00:00")).replace(tzinfo=None)
+        return pub_dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return published_iso
+
+
+def get_avg_view_durations(ya, video_ids, start, end):
+    """Запрашивает averageViewDuration отдельно для каждого видео"""
+    avg_durations = {}
+    for vid in video_ids:
+        try:
+            r = analytics_query(
+                ya, ids="channel==MINE",
+                startDate=start.isoformat(), endDate=end.isoformat(),
+                metrics="averageViewDuration",
+                filters=f"video=={vid}",
+            )
+            if r.get("rows"):
+                avg_durations[vid] = r["rows"][0][0]
+            else:
+                avg_durations[vid] = 0
+        except Exception as e:
+            print(f"  ⚠️ averageViewDuration для {vid}: {e}")
+            avg_durations[vid] = 0
+    return avg_durations
+
+
+# ============================ YOUTUBE ХЕЛПЕРЫ ============================
+def get_my_channel(yt):
+    resp = yt.channels().list(part="id,snippet,statistics", mine=True).execute()
+    items = resp.get("items", [])
+    if not items:
+        raise RuntimeError("Канал не найден.")
+    item = items[0]
+    return {
+        "id": item["id"],
+        "title": item["snippet"]["title"],
+        "published_at": item["snippet"].get("publishedAt"),
+        "subscribers": item.get("statistics", {}).get("subscriberCount"),
+        "videos": item.get("statistics", {}).get("videoCount"),
+        "views": item.get("statistics", {}).get("viewCount"),
+        "thumbnail": item["snippet"].get("thumbnails", {}).get("default", {}).get("url"),
+    }
+
+
+def analytics_query(ya, **kwargs):
+    return ya.reports().query(**kwargs).execute()
+
+
+def get_video_details(yt, video_ids):
+    """Возвращает словарь {video_id: {'title', 'published', 'duration', 'is_short'}}"""
+    details = {}
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i:i+50]
+        if not chunk:
+            continue
+        v = yt.videos().list(
+            part="snippet,contentDetails",
+            id=",".join(chunk)
+        ).execute()
+        for item in v.get("items", []):
+            duration_iso = item["contentDetails"].get("duration", "PT0S")
+            seconds = parse_iso_duration(duration_iso)
+            details[item["id"]] = {
+                "title": item["snippet"]["title"],
+                "published": item["snippet"].get("publishedAt", ""),
+                "duration": seconds,
+                "is_short": seconds <= 60,
+            }
+    return details
+
+
+def get_overview(ya, start, end):
+    r = analytics_query(
+        ya, ids="channel==MINE", startDate=start, endDate=end,
+        metrics="views,estimatedMinutesWatched,likes,comments,shares,subscribersGained,subscribersLost",
+    )
+    headers = [h["name"] for h in r["columnHeaders"]]
+    rows = r.get("rows", [[0] * len(headers)])
+    return dict(zip(headers, rows[0] if rows else []))
+
+
+def get_subscribers_growth(ya, start, end):
+    r = analytics_query(
+        ya, ids="channel==MINE", startDate=start, endDate=end,
+        metrics="subscribersGained,subscribersLost", dimensions="day", sort="day",
+    )
+    return r.get("rows", []), [h["name"] for h in r["columnHeaders"]]
+
+
+def get_device_distribution(ya, start, end):
+    r = analytics_query(
+        ya, ids="channel==MINE", startDate=start, endDate=end,
+        metrics="views,estimatedMinutesWatched", dimensions="deviceType", sort="-views",
+    )
+    return r.get("rows", []), [h["name"] for h in r["columnHeaders"]]
+
+
+def get_week_views(ya):
+    end = dt.date.today() - dt.timedelta(days=1)
+    start = end - dt.timedelta(days=6)
+    r = analytics_query(
+        ya, ids="channel==MINE", startDate=start.isoformat(), endDate=end.isoformat(),
+        metrics="views,estimatedMinutesWatched", dimensions="day", sort="day",
+    )
+    return r.get("rows", []), [h["name"] for h in r["columnHeaders"]]
+
+
+def get_top_videos_week(ya, yt, limit=10):
+    end = dt.date.today() - dt.timedelta(days=1)
+    start = end - dt.timedelta(days=6)
+
+    r = analytics_query(
+        ya, ids="channel==MINE",
+        startDate=start.isoformat(), endDate=end.isoformat(),
+        metrics="views,likes,comments",
+        dimensions="video", sort="-views", maxResults=limit,
+    )
+    rows = r.get("rows", [])
+
+    video_ids_list = [row[0] for row in rows]
+    avg_durations = get_avg_view_durations(ya, video_ids_list, start, end)
+
+    details = get_video_details(yt, video_ids_list)
+    out = []
+    for vid, views, likes, comments in rows:
+        d = details.get(vid, {})
+        content_type = "Shorts" if d.get("is_short") else "Видео"
+        avg_dur = avg_durations.get(vid, 0)
+        out.append([
+            vid,
+            d.get("title", "—"),
+            content_type,
+            views, likes, comments,
+            round(avg_dur / 60, 2),
+            format_published(d.get("published", "")),
+        ])
+
+    return out, [
+        "video_id", "title", "Тип",
+        "views", "likes", "comments",
+        "Ср. просмотр (мин)", "Дата публикации"
+    ]
+
+
+def get_top_videos_month(ya, yt, limit=10):
+    end = dt.date.today() - dt.timedelta(days=1)
+    start = end - dt.timedelta(days=29)
+
+    r = analytics_query(
+        ya, ids="channel==MINE",
+        startDate=start.isoformat(), endDate=end.isoformat(),
+        metrics="views,likes,comments",
+        dimensions="video", sort="-views", maxResults=limit,
+    )
+    rows = r.get("rows", [])
+
+    video_ids_list = [row[0] for row in rows]
+    avg_durations = get_avg_view_durations(ya, video_ids_list, start, end)
+
+    details = get_video_details(yt, video_ids_list)
+    out = []
+    for vid, views, likes, comments in rows:
+        d = details.get(vid, {})
+        content_type = "Shorts" if d.get("is_short") else "Видео"
+        avg_dur = avg_durations.get(vid, 0)
+        out.append([
+            vid,
+            d.get("title", "—"),
+            content_type,
+            views, likes, comments,
+            round(avg_dur / 60, 2),
+            format_published(d.get("published", "")),
+        ])
+
+    return out, [
+        "video_id", "title", "Тип",
+        "views", "likes", "comments",
+        "Ср. просмотр (мин)", "Дата публикации"
+    ]
+
+
+def get_trending_videos(ya, yt, limit=10):
+    today = dt.date.today()
+    curr_end = today - dt.timedelta(days=1)
+    curr_start = curr_end - dt.timedelta(days=6)
+    prev_end = curr_start - dt.timedelta(days=1)
+    prev_start = prev_end - dt.timedelta(days=6)
+
+    def _query(start, end):
+        r = analytics_query(
+            ya, ids="channel==MINE",
+            startDate=start.isoformat(), endDate=end.isoformat(),
+            metrics="views", dimensions="video", sort="-views", maxResults=200,
+        )
+        return {row[0]: row[1] for row in r.get("rows", [])}
+
+    curr = _query(curr_start, curr_end)
+    prev = _query(prev_start, prev_end)
+
+    video_ids = set(curr) | set(prev)
+    rows = []
+    for vid in video_ids:
+        c = curr.get(vid, 0)
+        p = prev.get(vid, 0)
+        delta = c - p
+        growth = round((c - p) / p * 100, 2) if p > 0 else (100.0 if c > 0 else 0.0)
+        rows.append([vid, c, p, delta, growth])
+
+    rows.sort(key=lambda x: x[3], reverse=True)
+    rows = [r for r in rows if r[3] > 0][:limit]
+
+    video_ids_list = [r[0] for r in rows]
+    avg_durations = get_avg_view_durations(ya, video_ids_list, curr_start, curr_end)
+
+    details = get_video_details(yt, video_ids_list)
+    out = []
+    for vid, curr_w, prev_w, delta, growth in rows:
+        d = details.get(vid, {})
+        content_type = "Shorts" if d.get("is_short") else "Видео"
+        avg_dur = avg_durations.get(vid, 0)
+        out.append([
+            vid,
+            d.get("title", "—"),
+            content_type,
+            curr_w, prev_w, delta, growth,
+            round(avg_dur / 60, 2),
+            format_published(d.get("published", "")),
+        ])
+
+    return out, [
+        "video_id", "title", "Тип",
+        "Просм. тек. нед.", "Просм. прош. нед.", "Прирост", "Рост %",
+        "Ср. просмотр (мин)", "Дата публикации"
+    ]
+
+
+# ============================ TELEGRAM BOT: ОТПРАВКА ОТЧЁТА ============================
+def send_report_to_telegram(file_path, caption=""):
+    """Отправляет HTML-файл в Telegram через Bot API"""
+    if not TG_BOT_TOKEN or TG_BOT_TOKEN == "8982231051:AAEx4CbsSLZNFmBnA8ZFJZxJ-1xUpUFWrmQ":
+        print("⚠️ TG_BOT_TOKEN не задан — пропускаем отправку")
+        return False
+    if not TG_REPORT_CHAT_ID or TG_REPORT_CHAT_ID == "ВАШ_CHAT_ID":
+        print("⚠️ TG_REPORT_CHAT_ID не задан — пропускаем отправку")
+        return False
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument"
+
+    # Проверка размера файла (лимит Bot API — 50 МБ)
+    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    if size_mb > 50:
+        print(f"⚠️ Файл слишком большой ({size_mb:.1f} МБ) — Bot API не примет")
+        return False
+
+    try:
+        with open(file_path, "rb") as f:
+            response = requests.post(
+                url,
+                data={
+                    "chat_id": TG_REPORT_CHAT_ID,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                },
+                files={"document": f},
+                timeout=120,
+            )
+
+        result = response.json()
+        if result.get("ok"):
+            print(f"✅ Отчёт отправлен в Telegram (chat_id: {TG_REPORT_CHAT_ID})")
+            return True
+        else:
+            print(f"❌ Ошибка отправки: {result.get('description')}")
+            return False
+    except Exception as e:
+        print(f"❌ Ошибка отправки в Telegram: {e}")
+        return False
+
+
+# ============================ TELEGRAM: СБОР ДАННЫХ (ЗАКОММЕНТИРОВАНО) ============================
+# async def _tg_collect(days=30):
+#     ...
+# async def _get_traffic_sources(client, entity):
+#     ...
+# def get_telegram_data(days=30):
+#     ...
+
+
+# ============================ VK: СБОР ДАННЫХ (ЗАКОММЕНТИРОВАНО) ============================
+# def get_vk_group_info(group_id, token):
+#     ...
+# def get_vk_stats(group_id, token, days=30):
+#     ...
+# def get_vk_demographics(group_id, token, days=30):
+#     ...
+# def get_vk_data(days=30):
+#     ...
+
+
+# ============================ HTML-РЕНДЕР ============================
+def fmt(n):
+    try:
+        return f"{int(n):,}".replace(",", " ")
+    except:
+        return str(n)
+
+
+def table_html(rows, headers):
+    html = '<table><thead><tr>'
+    for h in headers:
+        html += f'<th>{h}</th>'
+    html += '</tr></thead><tbody>'
+    for row in rows:
+        html += '<tr>'
+        for i, cell in enumerate(row):
+            if isinstance(cell, (int, float)):
+                if 'рост' in headers[i].lower() and '%' in headers[i]:
+                    cls = 'positive' if cell >= 0 else 'negative'
+                    html += f'<td class="{cls}">{cell}%</td>'
+                elif 'прирост' in headers[i].lower():
+                    cls = 'positive' if cell >= 0 else 'negative'
+                    sign = '+' if cell >= 0 else ''
+                    html += f'<td class="{cls}">{sign}{fmt(cell)}</td>'
+                else:
+                    html += f'<td>{fmt(cell)}</td>'
+            elif str(cell) == "Shorts":
+                html += f'<td><span style="background:#ff0000;color:#fff;padding:2px 8px;border-radius:10px;font-size:12px;">Shorts</span></td>'
+            elif str(cell) == "Видео":
+                html += f'<td><span style="background:#667eea;color:#fff;padding:2px 8px;border-radius:10px;font-size:12px;">Видео</span></td>'
+            else:
+                html += f'<td>{cell}</td>'
+        html += '</tr>'
+    html += '</tbody></table>'
+    return html
+
+
+# ============================ TELEGRAM HTML (ЗАКОММЕНТИРОВАНО) ============================
+# def render_traffic_sources(sources):
+#     ...
+# def render_hashtags(tags):
+#     ...
+# def render_telegram_section(tg):
+#     ...
+
+
+# ============================ VK HTML (ЗАКОММЕНТИРОВАНО) ============================
+# def render_vk_section(vk):
+#     ...
+
+
+def generate_html_report(
+    channel, overview,
+    subs_data, subs_headers,
+    device_data, device_headers,
+    week_data, week_headers,
+    top_week, top_week_headers,
+    top_month, top_month_headers,
+    trending, trending_headers,
+    tg_section_html="",
+    vk_section_html="",
+):
+    subs_chart = {
+        "labels": [r[0] for r in subs_data],
+        "gained": [r[1] for r in subs_data],
+        "lost": [r[2] for r in subs_data],
+    }
+    device_chart = {
+        "labels": [r[0] for r in device_data],
+        "views": [r[1] for r in device_data],
+    }
+    week_chart = {
+        "labels": [r[0] for r in week_data],
+        "views": [r[1] for r in week_data],
+    }
+
+    return f'''<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Сводная аналитика</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+    * {{ margin:0; padding:0; box-sizing:border-box; }}
+    body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f7fa; color:#2c3e50; padding:20px; }}
+    .container {{ max-width:1400px; margin:0 auto; }}
+    .header {{ background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); color:#fff; padding:30px; border-radius:16px; margin-bottom:24px; display:flex; align-items:center; gap:24px; box-shadow:0 10px 30px rgba(102,126,234,.3); }}
+    .header img {{ width:80px; height:80px; border-radius:50%; border:4px solid rgba(255,255,255,.3); }}
+    .header h1 {{ font-size:32px; margin-bottom:8px; }}
+    .header p {{ opacity:.9; font-size:14px; }}
+    .header .stats {{ margin-left:auto; display:flex; gap:24px; text-align:center; }}
+    .header .stats .value {{ font-size:28px; font-weight:700; }}
+    .header .stats .label {{ font-size:12px; opacity:.8; text-transform:uppercase; }}
+    .kpi-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; margin-bottom:24px; }}
+    .kpi {{ background:#fff; padding:24px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,.05); border-left:4px solid #667eea; }}
+    .kpi .label {{ font-size:13px; color:#7f8c8d; text-transform:uppercase; letter-spacing:.5px; margin-bottom:8px; }}
+    .kpi .value {{ font-size:32px; font-weight:700; color:#2c3e50; }}
+    .kpi .value.positive {{ color:#27ae60; }}
+    .kpi .value.negative {{ color:#e74c3c; }}
+    .card {{ background:#fff; padding:24px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,.05); margin-bottom:24px; }}
+    .card h2 {{ font-size:20px; margin-bottom:20px; color:#2c3e50; display:flex; align-items:center; gap:8px; }}
+    .card h2::before {{ content:''; width:4px; height:20px; background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); border-radius:2px; }}
+    .grid-2 {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(500px,1fr)); gap:24px; margin-bottom:24px; }}
+    .chart-container {{ position:relative; height:300px; }}
+    table {{ width:100%; border-collapse:collapse; font-size:14px; }}
+    th {{ background:#f8f9fa; padding:12px; text-align:left; font-weight:600; border-bottom:2px solid #e9ecef; }}
+    td {{ padding:12px; border-bottom:1px solid #f1f3f5; }}
+    tr:hover td {{ background:#f8f9fa; }}
+    td.positive {{ color:#27ae60; font-weight:600; }}
+    td.negative {{ color:#e74c3c; font-weight:600; }}
+    a {{ color:#667eea; text-decoration:none; }}
+    a:hover {{ text-decoration:underline; }}
+    .footer {{ text-align:center; color:#95a5a6; font-size:12px; margin-top:40px; padding:20px; }}
+    @media (max-width:768px) {{ .header {{ flex-direction:column; text-align:center; }} .header .stats {{ margin-left:0; flex-wrap:wrap; justify-content:center; }} .grid-2 {{ grid-template-columns:1fr; }} }}
+</style>
+</head>
+<body>
+<div class="container">
+
+    <div class="header">
+        <img src="{channel["thumbnail"] or ""}" alt="Channel">
+        <div>
+            <h1>{channel["title"]}</h1>
+            <p>Отчёт сформирован: {dt.datetime.now().strftime("%d.%m.%Y %H:%M")}</p>
+        </div>
+        <div class="stats">
+            <div><div class="value">{fmt(channel["subscribers"] or 0)}</div><div class="label">Подписчиков</div></div>
+            <div><div class="value">{fmt(channel["videos"] or 0)}</div><div class="label">Видео</div></div>
+            <div><div class="value">{fmt(channel["views"] or 0)}</div><div class="label">Просмотров</div></div>
+        </div>
+    </div>
+
+    <h2 style="margin-bottom:16px;font-size:22px;">📊 YouTube — показатели за 30 дней</h2>
+    <div class="kpi-grid">
+        <div class="kpi"><div class="label">Просмотры</div><div class="value">{fmt(overview.get("views",0))}</div></div>
+        <div class="kpi"><div class="label">Минут просмотра</div><div class="value">{fmt(overview.get("estimatedMinutesWatched",0))}</div></div>
+        <div class="kpi"><div class="label">Лайки</div><div class="value positive">{fmt(overview.get("likes",0))}</div></div>
+        <div class="kpi"><div class="label">Комментарии</div><div class="value">{fmt(overview.get("comments",0))}</div></div>
+        <div class="kpi"><div class="label">Поделились</div><div class="value">{fmt(overview.get("shares",0))}</div></div>
+        <div class="kpi"><div class="label">Подписчики (+/-)</div><div class="value {"positive" if (overview.get("subscribersGained",0)-overview.get("subscribersLost",0))>=0 else "negative"}">{fmt(overview.get("subscribersGained",0)-overview.get("subscribersLost",0))}</div></div>
+    </div>
+
+    <div class="grid-2">
+        <div class="card"><h2>Рост подписчиков (30 дней)</h2><div class="chart-container"><canvas id="subsChart"></canvas></div></div>
+        <div class="card"><h2>Просмотры по платформам</h2><div class="chart-container"><canvas id="deviceChart"></canvas></div></div>
+    </div>
+
+    <div class="card"><h2>Просмотры за последнюю неделю</h2><div class="chart-container"><canvas id="weekChart"></canvas></div></div>
+
+    <div class="card"><h2>🔥 Топ-10 видео за неделю</h2>{table_html(top_week, top_week_headers)}</div>
+    <div class="card"><h2>📅 Топ-10 видео за месяц</h2>{table_html(top_month, top_month_headers)}</div>
+    <div class="card"><h2>🚀 Быстро набирающие просмотры (неделя к неделе)</h2>{table_html(trending, trending_headers)}</div>
+
+    {vk_section_html}
+    {tg_section_html}
+
+    <div class="footer">Отчёт сформирован автоматически · {dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")}</div>
+</div>
+
+<script>
+    const chartDefaults = {{
+        responsive:true, maintainAspectRatio:false,
+        plugins:{{ legend:{{ position:'bottom' }} }},
+        scales:{{ y:{{ beginAtZero:true, grid:{{ color:'#f1f3f5' }} }}, x:{{ grid:{{ display:false }} }} }}
+    }};
+
+    new Chart(document.getElementById('subsChart'), {{
+        type:'line',
+        data:{{ labels:{json.dumps(subs_chart["labels"])},
+            datasets:[
+                {{ label:'Получено', data:{json.dumps(subs_chart["gained"])}, borderColor:'#27ae60', backgroundColor:'rgba(39,174,96,0.1)', fill:true, tension:0.4 }},
+                {{ label:'Потеряно', data:{json.dumps(subs_chart["lost"])}, borderColor:'#e74c3c', backgroundColor:'rgba(231,76,60,0.1)', fill:true, tension:0.4 }}
+            ] }},
+        options:chartDefaults
+    }});
+
+    new Chart(document.getElementById('deviceChart'), {{
+        type:'doughnut',
+        data:{{ labels:{json.dumps(device_chart["labels"])},
+            datasets:[{{ data:{json.dumps(device_chart["views"])}, backgroundColor:['#667eea','#764ba2','#f093fb','#4facfe','#43e97b'] }}] }},
+        options:{{ responsive:true, maintainAspectRatio:false, plugins:{{ legend:{{ position:'bottom' }} }} }}
+    }});
+
+    new Chart(document.getElementById('weekChart'), {{
+        type:'bar',
+        data:{{ labels:{json.dumps(week_chart["labels"])},
+            datasets:[{{ label:'Просмотры', data:{json.dumps(week_chart["views"])}, backgroundColor:'rgba(102,126,234,0.7)', borderRadius:8 }}] }},
+        options:chartDefaults
+    }});
+</script>
+</body>
+</html>'''
+
+
+# ============================ MAIN ============================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("YOUTUBE ANALYTICS + ОТПРАВКА В TELEGRAM")
+    print("=" * 60)
+
+    if os.path.exists(TOKEN_FILE):
+        os.remove(TOKEN_FILE)
+        print(f"Старый токен {TOKEN_FILE} удалён")
+
+    creds = get_credentials()
+    yt = build_service("youtube", "v3", creds)
+    ya = build_service("youtubeAnalytics", "v2", creds)
+
+    print("\nПолучение данных канала...")
+    channel = get_my_channel(yt)
+    print(f"Канал: {channel['title']} ({channel['id']})")
+
+    today = dt.date.today()
+    end_30 = today - dt.timedelta(days=1)
+    start_30 = end_30 - dt.timedelta(days=29)
+
+    print("\n[1/6] Общий обхват...")
+    overview = get_overview(ya, start_30.isoformat(), end_30.isoformat())
+
+    print("[2/6] Рост подписчиков...")
+    subs_data, subs_headers = get_subscribers_growth(ya, start_30.isoformat(), end_30.isoformat())
+
+    print("[3/6] Распределение по платформам...")
+    device_data, device_headers = get_device_distribution(ya, start_30.isoformat(), end_30.isoformat())
+
+    print("[4/6] Просмотры за неделю...")
+    week_data, week_headers = get_week_views(ya)
+
+    print("[5/6] Топ видео за неделю / месяц...")
+    top_week, top_week_headers = get_top_videos_week(ya, yt, limit=10)
+    top_month, top_month_headers = get_top_videos_month(ya, yt, limit=10)
+
+    print("[6/6] Быстро набирающие просмотры...")
+    trending, trending_headers = get_trending_videos(ya, yt, limit=10)
+
+    # ============================ TELEGRAM (ЗАКОММЕНТИРОВАНО) ============================
+    # print("\n[TG] Сбор данных Telegram...")
+    # tg_data = get_telegram_data(days=30)
+    # if tg_data:
+    #     print(f"  Подписчиков: {tg_data['subscribers']}, постов: {tg_data['posts_count']}")
+    # tg_section_html = render_telegram_section(tg_data)
+    tg_section_html = ""
+
+    # ============================ VK (ЗАКОММЕНТИРОВАНО) ============================
+    # print("\n[VK] Сбор данных ВКонтакте...")
+    # vk_data = get_vk_data(days=30)
+    # if vk_data:
+    #     print(f"  Сообщество: {vk_data['info'].get('name')}")
+    #     print(f"  Подписчиков: {vk_data['info'].get('members_count')}")
+    #     print(f"  Просмотров за 30 дней: {vk_data['total'].get('views')}")
+    #     vk_section_html = render_vk_section(vk_data)
+    # else:
+    #     print("  ⚠️ Данные VK недоступны")
+    vk_section_html = ""
+
+    print("\nГенерация HTML-отчёта...")
+    html = generate_html_report(
+        channel, overview,
+        subs_data, subs_headers,
+        device_data, device_headers,
+        week_data, week_headers,
+        top_week, top_week_headers,
+        top_month, top_month_headers,
+        trending, trending_headers,
+        tg_section_html=tg_section_html,
+        vk_section_html=vk_section_html,
+    )
+
+    html_path = os.path.join(OUTPUT_DIR, "report.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"\n✅ Отчёт: {os.path.abspath(html_path)}")
+
+    # ============================ ОТПРАВКА В TELEGRAM ============================
+    print("\nОтправка отчёта в Telegram...")
+    caption = (
+        f"📊 <b>YouTube Analytics</b>\n"
+        f"<b>{channel['title']}</b>\n"
+        f"Период: последние 30 дней\n"
+        f"Сформирован: {dt.datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    )
+    send_report_to_telegram(html_path, caption=caption)
